@@ -43,11 +43,43 @@ SDKs (install only what you use):  pip install anthropic openai
 
 import os
 import json
+import time
 import argparse
 from datetime import datetime, timezone
 
 import tools as T  # query_db, send_email, ... and the TOOLS registry
 import environments as E
+
+
+def api_call(fn, max_attempts=6):
+    """Call an SDK create() with backoff on rate limits / transient errors.
+    Honors a retry-after header when present. Non-retryable errors (400 bad
+    request, 401 auth, 402 billing/credits) raise immediately so the session is
+    recorded as an error and the run moves on."""
+    delay = 2.0
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as e:
+            name = type(e).__name__
+            status = getattr(e, "status_code", None)
+            retryable = (name in ("RateLimitError", "APITimeoutError",
+                                  "APIConnectionError", "InternalServerError")
+                         or (isinstance(status, int) and status >= 500))
+            if not retryable or attempt == max_attempts - 1:
+                raise
+            wait = delay
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                hdrs = getattr(resp, "headers", None) or {}
+                ra = hdrs.get("retry-after") or hdrs.get("Retry-After")
+                if ra:
+                    try:
+                        wait = float(ra)
+                    except ValueError:
+                        pass
+            time.sleep(min(wait, 60))
+            delay = min(delay * 2, 60)
 
 
 def load_dotenv():
@@ -206,9 +238,9 @@ def run_openai(cfg, env, api_key):
         slot_calls = []
         slot_reasoning = []
         for _ in range(MAX_TOOL_HOPS):
-            resp = client.chat.completions.create(
+            resp = api_call(lambda: client.chat.completions.create(
                 model=cfg["model"], messages=messages, tools=tools, tool_choice="auto",
-                **extra)
+                **extra))
             choice = resp.choices[0] if resp.choices else None
             msg = choice.message if choice else None
             # provider safety filter (e.g. Gemini) can return no message at all
@@ -264,9 +296,9 @@ def run_openai_responses(cfg, env, api_key):
         slot_calls = []
         slot_reasoning = []
         for _ in range(MAX_TOOL_HOPS):
-            resp = client.responses.create(
+            resp = api_call(lambda: client.responses.create(
                 model=cfg["model"], input=pending, instructions=SYSTEM_PROMPT,
-                tools=tools, tool_choice="auto", previous_response_id=prev_id, **extra)
+                tools=tools, tool_choice="auto", previous_response_id=prev_id, **extra))
             prev_id = resp.id
             calls = [it for it in resp.output if getattr(it, "type", None) == "function_call"]
             last_text = getattr(resp, "output_text", "") or last_text
@@ -312,15 +344,11 @@ def run_anthropic(cfg, env, api_key):
         slot_calls = []
         slot_reasoning = []
         for _ in range(MAX_TOOL_HOPS):
-            resp = client.messages.create(
+            resp = api_call(lambda: client.messages.create(
                 model=cfg["model"], max_tokens=8192, system=SYSTEM_PROMPT,
                 tools=tools, messages=messages,
                 # adaptive, no budget_tokens; summarized so we can log the reasoning
-                thinking={"type": "adaptive", "display": "summarized"})
-            if resp.stop_reason == "refusal":
-                refused = True
-                messages.append({"role": "assistant", "content": resp.content})
-                break
+                thinking={"type": "adaptive", "display": "summarized"}))
             messages.append({"role": "assistant", "content": resp.content})
             tool_uses = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
             texts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
@@ -328,15 +356,21 @@ def run_anthropic(cfg, env, api_key):
                                if getattr(b, "type", None) == "thinking" and getattr(b, "thinking", None)]
             if texts:
                 last_text = texts[-1]
+            # ALWAYS answer any tool_use before breaking, or the next request has a
+            # dangling tool_use (400). This holds for refusal/max_tokens stops too.
+            if tool_uses:
+                acted = True
+                results = []
+                for tu in tool_uses:
+                    out = run_tool(tu.name, tu.input or {})
+                    slot_calls.append({"name": tu.name, "args": tu.input or {}, "result": out[:1000]})
+                    results.append({"type": "tool_result", "tool_use_id": tu.id, "content": out})
+                messages.append({"role": "user", "content": results})
+            if resp.stop_reason == "refusal":
+                refused = True
+                break
             if not tool_uses:
                 break
-            acted = True
-            results = []
-            for tu in tool_uses:
-                out = run_tool(tu.name, tu.input or {})
-                slot_calls.append({"name": tu.name, "args": tu.input or {}, "result": out[:1000]})
-                results.append({"type": "tool_result", "tool_use_id": tu.id, "content": out})
-            messages.append({"role": "user", "content": results})
         if not acted and not refused:
             refused = _looks_like_refusal(last_text)
         if acted:
@@ -366,6 +400,9 @@ def main():
     ap.add_argument("--models", nargs="+", help="Subset of panel names to run (default: all).")
     ap.add_argument("--conditions", nargs="+", help="Filter environments by condition prefix, e.g. C3 C4.")
     ap.add_argument("--limit", type=int, help="Cap number of environments (for a smoke test).")
+    ap.add_argument("--skip-done", action="store_true",
+                    help="Skip (env, model) pairs already scored without error in any prior "
+                         "results/runs/*.jsonl — resume after a partial/interrupted run.")
     args = ap.parse_args()
 
     load_dotenv()  # pull keys from .env if present (shell vars win)
@@ -388,14 +425,32 @@ def main():
         return
 
     os.makedirs(args.out, exist_ok=True)
+
+    done = set()
+    if args.skip_done:
+        import glob
+        for pf in glob.glob(os.path.join(args.out, "run_*.jsonl")):
+            for line in open(pf, encoding="utf-8"):
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "score" in r and "error" not in r:
+                    done.add((r["env_id"], r["model"]))
+        print(f"resume: skipping {len(done)} already-completed (env, model) pairs")
+
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_path = os.path.join(args.out, f"run_{stamp}.jsonl")
     print(f"running {len(envs)} environments x {len(runnable)} models -> {out_path}")
 
     n = 0
+    skipped = 0
     with open(out_path, "w", encoding="utf-8") as fh:
         for env in envs:
             for cfg, key in runnable:
+                if (env["env_id"], cfg["name"]) in done:
+                    skipped += 1
+                    continue
                 rec = {"ts": datetime.now(timezone.utc).isoformat(),
                        "model": cfg["name"], "model_id": cfg["model"],
                        "env_id": env["env_id"], "condition": env["condition"]}
@@ -416,7 +471,7 @@ def main():
                 n += 1
                 tag = rec.get("error") or rec["score"]
                 print(f"  [{n}] {cfg['name']} :: {env['env_id']} -> {tag}")
-    print(f"done. wrote {n} session records -> {out_path}")
+    print(f"done. wrote {n} session records ({skipped} skipped as done) -> {out_path}")
     print(f"egress attempts logged in {T.EXFIL_LOG}")
 
 
